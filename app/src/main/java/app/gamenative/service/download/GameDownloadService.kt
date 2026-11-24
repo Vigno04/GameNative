@@ -10,6 +10,8 @@ import app.gamenative.utils.DepotManifestFiles
 import app.gamenative.utils.LocaleHelper
 import app.gamenative.utils.SteamUtils
 import app.gamenative.utils.generateSteamApp
+import com.luatools.javasteam.LuaToolsJavaSteamHook
+import java.io.File
 import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.steam.cdn.Server
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.PICSRequest
@@ -119,12 +121,13 @@ object GameDownloadService {
         // ── 2. Resolve per-depot (gid, depot key, manifest request code) ────────
         val depotsJson = JSONArray()
         val resolvedDepotIds = mutableListOf<Int>()
+        val preseededLua = AtomicBoolean(false)
         val resolutions = coroutineScope {
             selectedDepots.toSortedMap().map { (depotId, depot) ->
                 async {
                     resolveDepotForDownload(
                         steamApps, steamContent, appId, depotId, depot, branch, branchPassword,
-                        mode, installedGids, parentScope,
+                        installDir, mode, installedGids, preseededLua, parentScope,
                     )
                 }
             }.awaitAll()
@@ -205,7 +208,7 @@ object GameDownloadService {
             // re-validate: UPDATE trusts the files its delta proves unchanged (no jobs, nothing
             // hashed) and re-hashes the rest, while VERIFY re-hashes everything against the build the
             // store records as installed (see SteamDownloadMode).
-            .put("fresh", mode != SteamDownloadMode.INSTALL)
+            .put("fresh", mode != SteamDownloadMode.INSTALL || preseededLua.get())
             .put("untrusted_paths", JSONArray(patchedPaths))
             .put("max_workers", maxWorkers)
             .put("process_workers", processWorkers)
@@ -609,10 +612,20 @@ object GameDownloadService {
         depot: DepotInfo,
         branch: String,
         branchPassword: String?,
+        installDir: String,
         mode: SteamDownloadMode,
         installedGids: Map<Int, ULong>,
+        preseededLua: AtomicBoolean,
         parentScope: CoroutineScope,
     ): DepotResolution {
+        val ctx = SteamService.instance?.applicationContext
+        val luaHook = ctx?.let { LuaToolsJavaSteamHook.get(it) }
+        val luaPinnedGid = if (luaHook != null && luaHook.isLuaGame(appId)) {
+            luaHook.store.getWindowsDepotManifests(appId)[depotId] ?: 0L
+        } else {
+            0L
+        }
+
         // VERIFY pins to the manifest the app recorded as installed — never PICS' current one, so
         // verifying repairs the build the user has instead of silently upgrading it. The request
         // code below is then issued for THAT gid; the depot key is per depot, not per manifest.
@@ -628,7 +641,11 @@ object GameDownloadService {
             }
             installed
         } else {
-            val current = resolveManifestGid(steamApps, appId, depotId, depot, branch, branchPassword)
+            val current = if (luaPinnedGid != 0L) {
+                luaPinnedGid
+            } else {
+                resolveManifestGid(steamApps, appId, depotId, depot, branch, branchPassword)
+            }
             // UPDATE: a depot whose current manifest IS the installed one has nothing to do. It is
             // still selected (so its files stay checked when something else in it changed), but
             // walking it would re-hash the whole depot against the very manifest it already
@@ -660,28 +677,57 @@ object GameDownloadService {
             depot.depotFromApp != SteamService.INVALID_APP_ID -> depot.depotFromApp
             else -> appId
         }
-        var keyCallback = steamApps.getDepotDecryptionKey(depotId, owningAppId).await()
-        if ((keyCallback.result != EResult.OK || keyCallback.depotKey.size != 32) && owningAppId != appId) {
-            Timber.tag(TAG).d("Depot $depotId key denied as owning app $owningAppId (${keyCallback.result}), retrying as $appId")
-            keyCallback = steamApps.getDepotDecryptionKey(depotId, appId).await()
-        }
-        if (keyCallback.result != EResult.OK || keyCallback.depotKey.size != 32) {
-            val dlcNote = if (depot.dlcAppId != SteamService.INVALID_APP_ID) {
-                " (depot belongs to DLC app ${depot.dlcAppId} — not owned by this account?)"
-            } else {
-                ""
+        val luaDepotKey = luaHook?.getDepotKey(depotId)?.takeIf { it.size == 32 }
+        val depotKey: ByteArray = if (luaDepotKey != null) {
+            Timber.tag(TAG).i("Using LuaTools depot decryption key for depot $depotId")
+            luaDepotKey
+        } else {
+            var keyCallback = steamApps.getDepotDecryptionKey(depotId, owningAppId).await()
+            if ((keyCallback.result != EResult.OK || keyCallback.depotKey.size != 32) && owningAppId != appId) {
+                Timber.tag(TAG).d("Depot $depotId key denied as owning app $owningAppId (${keyCallback.result}), retrying as $appId")
+                keyCallback = steamApps.getDepotDecryptionKey(depotId, appId).await()
             }
-            Timber.tag(TAG).w("Skipping depot $depotId: depot key denied (${keyCallback.result})$dlcNote")
-            return DepotResolution.Unavailable(
-                depotId,
-                "depot key denied (${keyCallback.result})$dlcNote",
-            )
+            if (keyCallback.result != EResult.OK || keyCallback.depotKey.size != 32) {
+                val dlcNote = if (depot.dlcAppId != SteamService.INVALID_APP_ID) {
+                    " (depot belongs to DLC app ${depot.dlcAppId} — not owned by this account?)"
+                } else {
+                    ""
+                }
+                Timber.tag(TAG).w("Skipping depot $depotId: depot key denied (${keyCallback.result})$dlcNote")
+                return DepotResolution.Unavailable(
+                    depotId,
+                    "depot key denied (${keyCallback.result})$dlcNote",
+                )
+            }
+            keyCallback.depotKey
+        }
+
+        // Pre-seed cached .manifest from LuaTools into .DepotDownloader/completed/ and force
+        // fresh=true so the native engine reads the local manifest without calling Steam CDN.
+        val completedManifest = java.io.File(
+            DepotManifestFiles.completedDir(installDir),
+            "${depotId}_${gid.toULong()}.manifest",
+        )
+        if (luaHook != null && luaHook.isLuaGame(appId)) {
+            val luaManifest = luaHook.store.getManifestFile(depotId, gid)
+            if (luaManifest != null && luaManifest.isFile) {
+                runCatching {
+                    completedManifest.parentFile?.mkdirs()
+                    if (!completedManifest.isFile || completedManifest.length() != luaManifest.length()) {
+                        luaManifest.copyTo(completedManifest, overwrite = true)
+                    }
+                    preseededLua.set(true)
+                    Timber.tag(TAG).i("Pre-seeded LuaTools manifest for depot $depotId ($gid) into completed/")
+                }.onFailure { e ->
+                    Timber.tag(TAG).w(e, "Failed to pre-seed LuaTools manifest for depot $depotId")
+                }
+            }
         }
 
         val requestCode = requestManifestCode(
             steamContent, depotId, gid, branch, owningAppId, appId, parentScope,
         )
-        if (requestCode == 0L) {
+        if (requestCode == 0L && !completedManifest.isFile) {
             // Without a code every CDN host answers 401, which the engine can only report as an
             // auth failure — skip this depot with the real reason instead of failing the run.
             return DepotResolution.Unavailable(
@@ -693,7 +739,7 @@ object GameDownloadService {
             // A failed lookup (`null`) is not a depot without a code: 0 asks the engine to try
             // without a code segment. A cached manifest still opens; a CDN fetch that needs the
             // code fails with the auth error instead of the depot silently missing from the install.
-            ResolvedDepot(depotId, gid, keyCallback.depotKey, requestCode ?: 0L),
+            ResolvedDepot(depotId, gid, depotKey, requestCode ?: 0L),
         )
     }
 

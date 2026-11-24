@@ -31,6 +31,7 @@ import app.gamenative.data.EncryptedAppTicket
 import app.gamenative.data.GameProcessInfo
 import app.gamenative.data.GameSource
 import app.gamenative.data.LaunchInfo
+import app.gamenative.data.ManifestInfo
 import app.gamenative.data.forBranch
 import app.gamenative.data.OwnedGames
 import app.gamenative.data.PostSyncInfo
@@ -50,13 +51,18 @@ import app.gamenative.db.dao.FileChangeListsDao
 import app.gamenative.db.dao.SteamAppDao
 import app.gamenative.db.dao.SteamFileHashCacheDao
 import app.gamenative.db.dao.SteamLicenseDao
+import app.gamenative.enums.AppType
 import app.gamenative.enums.LoginResult
 import app.gamenative.enums.Marker
 import app.gamenative.enums.OS
 import app.gamenative.enums.OSArch
 import app.gamenative.enums.PathType
+import app.gamenative.enums.ReleaseState
 import app.gamenative.enums.SaveLocation
 import app.gamenative.enums.SyncResult
+import com.luatools.javasteam.LuaToolsCloudSync
+import com.luatools.javasteam.LuaToolsJavaSteamHook
+import com.luatools.javasteam.LuaToolsSteamEmu
 import app.gamenative.events.AndroidEvent
 import app.gamenative.events.SteamEvent
 import app.gamenative.utils.ContainerUtils
@@ -81,7 +87,10 @@ import app.gamenative.service.download.SteamDownloadMode
 import `in`.dragonbra.javasteam.enums.EAccountType
 import `in`.dragonbra.javasteam.enums.EDepotFileFlag
 import `in`.dragonbra.javasteam.enums.ELicenseFlags
+import `in`.dragonbra.javasteam.enums.ELicenseType
 import `in`.dragonbra.javasteam.enums.EOSType
+import `in`.dragonbra.javasteam.enums.EPaymentMethod
+import java.util.Date
 import `in`.dragonbra.javasteam.enums.EPersonaState
 import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.enums.EUniverse
@@ -3388,6 +3397,222 @@ class SteamService : Service(), IChallengeUrlChanged {
             playtimePaused = false
         }
 
+        private const val LUATOOLS_PKG_BASE = 1_900_000_000
+
+        fun syncLuaToolsGames(context: Context) {
+            val hook = LuaToolsJavaSteamHook.get(context)
+            for (appId in hook.luaAppIds) {
+                syncLuaToolsApp(context, appId)
+            }
+        }
+
+        fun syncLuaToolsApp(context: Context, appId: Int) {
+            val svc = instance ?: return
+            val pkgId = LUATOOLS_PKG_BASE + (appId and 0x0FFFFFFF)
+            svc.scope.launch {
+                try {
+                    val hook = LuaToolsJavaSteamHook.get(context)
+                    if (!hook.isLuaGame(appId)) return@launch
+
+                    val now = Date()
+                    val currentOwnerId = userSteamId?.accountID?.toInt()
+                        ?: PrefManager.steamUserAccountId.takeIf { it != 0 }
+                    val ownerList = if (currentOwnerId != null) listOf(currentOwnerId) else emptyList()
+                    val luaDepotManifests = hook.store.getWindowsDepotManifests(appId)
+                    val luaDepotIds = luaDepotManifests.keys.toList()
+                    val existingLicense = svc.licenseDao.getAllLicenses().firstOrNull {
+                        it.packageId == pkgId || it.appIds.contains(appId)
+                    }
+                    if (existingLicense == null) {
+                        svc.licenseDao.insertAll(
+                            listOf(
+                                SteamLicense(
+                                    packageId = pkgId,
+                                    lastChangeNumber = 0,
+                                    timeCreated = now,
+                                    timeNextProcess = now,
+                                    minuteLimit = 0,
+                                    minutesUsed = 0,
+                                    paymentMethod = EPaymentMethod.Complimentary,
+                                    licenseFlags = EnumSet.noneOf(ELicenseFlags::class.java),
+                                    purchaseCode = "",
+                                    licenseType = ELicenseType.SinglePurchase,
+                                    territoryCode = 0,
+                                    accessToken = 0L,
+                                    ownerAccountId = ownerList,
+                                    masterPackageID = 0,
+                                    appIds = listOf(appId),
+                                    depotIds = luaDepotIds,
+                                ),
+                            ),
+                        )
+                    } else if (existingLicense.packageId == pkgId &&
+                        (!existingLicense.depotIds.containsAll(luaDepotIds) || existingLicense.ownerAccountId != ownerList)
+                    ) {
+                        svc.licenseDao.insertAll(
+                            listOf(
+                                existingLicense.copy(
+                                    ownerAccountId = if (ownerList.isNotEmpty()) ownerList else existingLicense.ownerAccountId,
+                                    depotIds = (existingLicense.depotIds + luaDepotIds).distinct(),
+                                ),
+                            ),
+                        )
+                    }
+
+                    val existingApp = svc.appDao.findApp(appId)
+                    val hasAllLuaDepots = existingApp != null &&
+                        luaDepotIds.all { id -> (existingApp.depots[id]?.manifests?.get("public")?.size ?: 0L) > 0L }
+                    if (existingApp != null &&
+                        existingApp.packageId != INVALID_PKG_ID &&
+                        existingApp.receivedPICS &&
+                        hasAllLuaDepots &&
+                        (ownerList.isEmpty() || existingApp.ownerAccountId.any { it in ownerList })
+                    ) {
+                        return@launch
+                    }
+
+                    val targetPkgId = existingLicense?.packageId ?: pkgId
+                    var resolvedApp: SteamApp? = null
+                    val steamApps = svc._steamApps
+                    if (steamApps != null && isConnected && (existingApp == null || !existingApp.receivedPICS)) {
+                        try {
+                            val token = try {
+                                steamApps.picsGetAccessTokens(
+                                    appIds = listOf(appId),
+                                    packageIds = emptyList(),
+                                ).await().appTokens[appId] ?: 0L
+                            } catch (_: Exception) {
+                                0L
+                            }
+                            val pics = steamApps.picsGetProductInfo(
+                                apps = listOf(PICSRequest(id = appId, accessToken = token)),
+                                packages = emptyList(),
+                            ).await()
+                            val remote = pics.results.firstOrNull()?.apps?.values?.firstOrNull()
+                            val kv = remote?.resolveAppKeyValues()
+                            if (kv != null) {
+                                resolvedApp = kv.generateSteamApp().copy(
+                                    id = appId,
+                                    packageId = targetPkgId,
+                                    ownerAccountId = ownerList,
+                                    receivedPICS = true,
+                                    lastChangeNumber = remote.changeNumber,
+                                )
+                            }
+                        } catch (e: Exception) {
+                            Timber.w(e, "syncLuaToolsApp: live PICS fetch failed for $appId")
+                        }
+                    }
+
+                    val baseApp = resolvedApp ?: existingApp ?: SteamApp(id = appId)
+                    val mergedDepots = baseApp.depots.toMutableMap()
+                    if (mergedDepots.isEmpty()) {
+                        mergedDepots.putAll(parseSteamCmdDepots(hook.store.getPicsInfo(appId)))
+                    }
+                    for ((depotId, manifestId) in luaDepotManifests) {
+                        val cur = mergedDepots[depotId]
+                        val curPub = cur?.manifests?.get("public")
+                        if (cur == null || curPub == null || curPub.size <= 0L) {
+                            val dm = runCatching {
+                                hook.loadDecryptedDepotManifest(depotId, manifestId) as? `in`.dragonbra.javasteam.types.DepotManifest
+                            }.getOrNull()
+                            val size = dm?.totalUncompressedSize ?: curPub?.size ?: 0L
+                            val download = dm?.totalCompressedSize ?: curPub?.download ?: size
+                            val newManifests = (cur?.manifests ?: emptyMap()).toMutableMap()
+                            newManifests["public"] = ManifestInfo(
+                                name = "public",
+                                gid = manifestId,
+                                size = size,
+                                download = download,
+                            )
+                            mergedDepots[depotId] = (cur ?: DepotInfo(
+                                depotId = depotId,
+                                dlcAppId = INVALID_APP_ID,
+                                depotFromApp = INVALID_APP_ID,
+                                sharedInstall = false,
+                                osList = EnumSet.of(OS.windows),
+                                osArch = OSArch.Arch64,
+                                manifests = newManifests,
+                                encryptedManifests = emptyMap(),
+                            )).copy(
+                                osList = cur?.osList?.takeIf { !it.contains(OS.none) } ?: EnumSet.of(OS.windows),
+                                manifests = newManifests,
+                            )
+                        }
+                    }
+
+                    val fallbackName = hook.store.getGameName(appId).ifBlank { "App $appId" }
+                    svc.appDao.insert(
+                        baseApp.copy(
+                            packageId = targetPkgId,
+                            ownerAccountId = if (ownerList.isNotEmpty()) ownerList else baseApp.ownerAccountId,
+                            name = baseApp.name.ifBlank { fallbackName },
+                            type = baseApp.type.takeIf { it != AppType.invalid } ?: AppType.game,
+                            osList = baseApp.osList.takeIf { !it.contains(OS.none) } ?: EnumSet.of(OS.windows),
+                            releaseState = ReleaseState.released,
+                            depots = mergedDepots,
+                            receivedPICS = baseApp.receivedPICS || mergedDepots.isNotEmpty(),
+                        ),
+                    )
+                    Timber.i("Synced LuaTools app $appId (pkg=$targetPkgId, depots=${mergedDepots.size}, pics=${resolvedApp != null})")
+                } catch (e: Exception) {
+                    Timber.w(e, "syncLuaToolsApp failed for $appId")
+                }
+            }
+        }
+
+        private fun parseSteamCmdDepots(picsJson: org.json.JSONObject?): Map<Int, DepotInfo> {
+            val depotsObj = picsJson?.optJSONObject("depots") ?: return emptyMap()
+            val out = mutableMapOf<Int, DepotInfo>()
+            val keys = depotsObj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val depotId = key.toIntOrNull() ?: continue
+                val d = depotsObj.optJSONObject(key) ?: continue
+                val cfg = d.optJSONObject("config")
+                val osStr = cfg?.optString("oslist", "")?.lowercase().orEmpty()
+                val osSet = EnumSet.noneOf(OS::class.java)
+                if (osStr.contains("windows")) osSet.add(OS.windows)
+                if (osStr.contains("linux")) osSet.add(OS.linux)
+                if (osStr.contains("macos") || osStr.contains("darwin")) osSet.add(OS.macos)
+                if (osSet.isEmpty()) osSet.add(OS.none)
+
+                val manifestsMap = mutableMapOf<String, ManifestInfo>()
+                val mObj = d.optJSONObject("manifests")
+                val mKeys = mObj?.keys()
+                if (mKeys != null) {
+                    while (mKeys.hasNext()) {
+                        val branch = mKeys.next()
+                        val bObj = mObj.optJSONObject(branch) ?: continue
+                        val gid = bObj.optString("gid", "").toULongOrNull()?.toLong() ?: 0L
+                        val size = bObj.optString("size", "0").toLongOrNull() ?: bObj.optLong("size", 0L)
+                        val download = bObj.optString("download", "0").toLongOrNull() ?: bObj.optLong("download", 0L)
+                        if (gid != 0L || size > 0L) {
+                            manifestsMap[branch] = ManifestInfo(
+                                name = branch,
+                                gid = gid,
+                                size = size,
+                                download = download,
+                            )
+                        }
+                    }
+                }
+                val dlcAppId = d.optString("dlcappid", "").toIntOrNull() ?: INVALID_APP_ID
+                val depotFromApp = d.optString("depotfromapp", "").toIntOrNull() ?: INVALID_APP_ID
+                out[depotId] = DepotInfo(
+                    depotId = depotId,
+                    dlcAppId = dlcAppId,
+                    depotFromApp = depotFromApp,
+                    sharedInstall = d.optString("sharedinstall", "0") == "1",
+                    osList = osSet,
+                    osArch = OSArch.Unknown,
+                    manifests = manifestsMap,
+                    encryptedManifests = emptyMap(),
+                )
+            }
+            return out
+        }
+
         fun beginLaunchApp(
             appId: Int,
             parentScope: CoroutineScope = CoroutineScope(Dispatchers.IO),
@@ -3399,6 +3624,16 @@ class SteamService : Service(), IChallengeUrlChanged {
             // html5 leveldb-backed titles opt in; see SteamAutoCloud.syncUserFiles.
             chromiumProfileSync: Boolean = false,
         ): Deferred<PostSyncInfo> = parentScope.asyncIsolated {
+            val luaCtx = instance?.applicationContext
+            if (luaCtx != null && LuaToolsJavaSteamHook.get(luaCtx).isLuaGame(appId)) {
+                LuaToolsSteamEmu.attachGameRuntime(luaCtx, appId, File(getAppDirPath(appId)))
+                val prefixDir = File(ImageFs.find(luaCtx).rootDir, ImageFs.WINEPREFIX)
+                val steamId64Str = (userSteamId?.convertToUInt64() ?: PrefManager.steamUserSteamId64)
+                    .takeIf { it != 0L }?.toString() ?: ""
+                val saveDir = LuaToolsCloudSync.resolveCloudSaveDir(luaCtx, appId, prefixDir, "xuser", steamId64Str)
+                LuaToolsCloudSync.onPreLaunch(luaCtx, appId, saveDir)
+                return@asyncIsolated PostSyncInfo(SyncResult.UpToDate)
+            }
             if (isOffline || !isConnected) {
                 return@asyncIsolated PostSyncInfo(SyncResult.UpToDate)
             }
@@ -3552,6 +3787,14 @@ class SteamService : Service(), IChallengeUrlChanged {
 
         suspend fun closeApp(context: Context, appId: Int, isOffline: Boolean, chromiumProfileSync: Boolean = false, prefixToPath: (String) -> String) = withContext(Dispatchers.IO) {
             async {
+                if (LuaToolsJavaSteamHook.get(context).isLuaGame(appId)) {
+                    val prefixDir = File(ImageFs.find(context).rootDir, ImageFs.WINEPREFIX)
+                    val steamId64Str = (userSteamId?.convertToUInt64() ?: PrefManager.steamUserSteamId64)
+                        .takeIf { it != 0L }?.toString() ?: ""
+                    val saveDir = LuaToolsCloudSync.resolveCloudSaveDir(context, appId, prefixDir, "xuser", steamId64Str)
+                    LuaToolsCloudSync.onPostExit(context, appId, saveDir)
+                    return@async
+                }
                 if (isOffline || !isConnected) {
                     instance?.addPendingSyncApp(appId)
                     return@async
@@ -4639,6 +4882,7 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
 
             isRunning = true
+            syncLuaToolsGames(applicationContext)
 
             // we should use Dispatchers.IO here since we are running a sleeping/blocking function
             // "The idea is that the IO dispatcher spends a lot of time waiting (IO blocked),
@@ -5507,6 +5751,8 @@ class SteamService : Service(), IChallengeUrlChanged {
                         packagePicsChannel.send(chunk)
                     }
             }
+
+            syncLuaToolsGames(applicationContext)
 
             // After licenses land, re-apply any preferred family lenders.
             if (familyGroupId != 0L && preferredLenderByAppId.isNotEmpty()) {

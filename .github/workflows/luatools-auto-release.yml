@@ -1,0 +1,152 @@
+name: Auto-Sync Upstream GameNative & Release LuaTools Mod
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Optional tag override (e.g. v1.4.1-luatools)'
+        required: false
+  push:
+    tags:
+      - 'v*-luatools*'
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check latest upstream GameNative release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.force_tag }}" ]; then
+            echo "release_tag=${{ github.event.inputs.force_tag }}" >> "$GITHUB_OUTPUT"
+            echo "upstream_tag=" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "${GITHUB_REF_NAME}" == *-luatools* ]]; then
+            echo "release_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "upstream_tag=" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          UPSTREAM_TAG=$(curl -fsSL https://api.github.com/repos/utkarshdalal/GameNative/releases/latest | jq -r '.tag_name')
+          TARGET_TAG="${UPSTREAM_TAG}-luatools"
+          echo "upstream_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "${TARGET_TAG}" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "Release ${TARGET_TAG} already exists; skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream release ${UPSTREAM_TAG} detected -> building ${TARGET_TAG}"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream release tag
+        if: steps.upstream.outputs.should_build == 'true' && steps.upstream.outputs.upstream_tag != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/utkarshdalal/GameNative.git || true
+          git fetch upstream tag "${{ steps.upstream.outputs.upstream_tag }}" --depth 1
+          git merge --no-edit -X ours "${{ steps.upstream.outputs.upstream_tag }}"
+
+      - name: Init submodules
+        if: steps.upstream.outputs.should_build == 'true'
+        run: git submodule update --init --recursive --depth 1
+
+      - name: Add swap
+        if: steps.upstream.outputs.should_build == 'true'
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile.ci
+          sudo chmod 600 /mnt/swapfile.ci
+          sudo mkswap /mnt/swapfile.ci
+          sudo swapon /mnt/swapfile.ci
+
+      - name: Set up JDK 17
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Gradle
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare local.properties & keystore
+        if: steps.upstream.outputs.should_build == 'true'
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEYSTORE_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEYSTORE_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
+          KEYSTORE_STORE_PASSWORD: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
+        run: |
+          touch local.properties
+          mkdir -p app/keystores
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 --decode > app/keystores/keystore
+            cat <<EOF > app/keystores/keystore.properties
+          storeFile=keystores/keystore
+          keyAlias=${KEYSTORE_KEY_ALIAS}
+          storePassword=${KEYSTORE_STORE_PASSWORD}
+          keyPassword=${KEYSTORE_KEY_PASSWORD}
+          EOF
+          fi
+
+      - name: Build ModernRelease APK
+        if: steps.upstream.outputs.should_build == 'true'
+        run: ./gradlew :app:assembleModernRelease --no-daemon
+
+      - name: Sign & Package APK
+        if: steps.upstream.outputs.should_build == 'true'
+        run: |
+          mkdir -p dist
+          APK=$(find app/build/outputs/apk/modern/release -name "*.apk" | head -1)
+          OUT="dist/GameNative-${{ steps.upstream.outputs.release_tag }}.apk"
+          if [[ "$APK" == *-unsigned.apk ]]; then
+            APKSIGNER="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
+            ZIPALIGN="${ANDROID_HOME}/build-tools/35.0.0/zipalign"
+            ALIGNED="dist/aligned.apk"
+            "$ZIPALIGN" -f -p 4 "$APK" "$ALIGNED"
+            keytool -genkeypair -v -keystore adhoc.jks -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=GameNative LuaTools,O=LuaTools,C=US"
+            "$APKSIGNER" sign --ks adhoc.jks --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out "$OUT" "$ALIGNED"
+            rm -f "$ALIGNED" adhoc.jks
+          else
+            cp "$APK" "$OUT"
+          fi
+          cd dist && sha256sum *.apk > SHA256SUMS.txt
+
+      - name: Push merged branch & Release
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.release_tag }}
+          name: GameNative ${{ steps.upstream.outputs.release_tag }}
+          body: |
+            ## GameNative + LuaTools & CloudRedirect Mod (${{ steps.upstream.outputs.release_tag }})
+
+            Automatically synced with upstream `utkarshdalal/GameNative` (${{ steps.upstream.outputs.upstream_tag }}) and built with the universal `luatools-javasteam-addon` bridge + CloudRedirect save sync.
+          files: |
+            dist/*

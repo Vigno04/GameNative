@@ -37,6 +37,7 @@
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" tools:node="remove" />
 
     <queries>
+        <package android:name="com.luatools.companion" />
         <package android:name="com.android.vending" />
         <intent>
             <action android:name="android.intent.action.VIEW" />
@@ -267,6 +268,12 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_provider_paths" />
         </provider>
+
+        <!-- LuaTools / CloudRedirect Bridge ContentProvider -->
+        <provider
+            android:name=".service.GameNativeLuaBridgeProvider"
+            android:authorities="${applicationId}.bh_lua_bridge"
+            android:exported="true" />
     </application>
 
 </manifest>
