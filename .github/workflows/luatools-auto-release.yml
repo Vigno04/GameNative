@@ -49,6 +49,10 @@ jobs:
           fi
 
           UPSTREAM_TAG=$(curl -fsSL https://api.github.com/repos/utkarshdalal/GameNative/releases/latest | jq -r '.tag_name')
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "::error::Failed to fetch latest upstream release tag"
+            exit 1
+          fi
           TARGET_TAG="${UPSTREAM_TAG}-luatools"
           echo "upstream_tag=${UPSTREAM_TAG}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
@@ -62,13 +66,25 @@ jobs:
           fi
 
       - name: Merge upstream release tag
+        id: merge
         if: steps.upstream.outputs.should_build == 'true' && steps.upstream.outputs.upstream_tag != ''
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/utkarshdalal/GameNative.git || true
-          git fetch upstream tag "${{ steps.upstream.outputs.upstream_tag }}" --depth 1
-          git merge --no-edit -X ours "${{ steps.upstream.outputs.upstream_tag }}"
+          UPSTREAM_TAG="${{ steps.upstream.outputs.upstream_tag }}"
+          git fetch upstream "refs/tags/${UPSTREAM_TAG}:refs/remotes/upstream/tags/${UPSTREAM_TAG}" --no-tags
+          UPSTREAM_COMMIT=$(git rev-list -n 1 "refs/remotes/upstream/tags/${UPSTREAM_TAG}")
+          if git merge-base --is-ancestor "${UPSTREAM_COMMIT}" HEAD; then
+            echo "Upstream ${UPSTREAM_TAG} (${UPSTREAM_COMMIT}) is already merged in HEAD."
+          else
+            if ! git merge --no-edit "${UPSTREAM_COMMIT}"; then
+              echo "Merge conflict detected; resolving with -X ours..."
+              git merge --abort
+              git merge --no-edit -X ours "${UPSTREAM_COMMIT}"
+            fi
+          fi
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Init submodules
         if: steps.upstream.outputs.should_build == 'true'
@@ -130,8 +146,9 @@ jobs:
           APK=$(find app/build/outputs/apk/modern/release -name "*.apk" | head -1)
           OUT="dist/GameNative-${{ steps.upstream.outputs.release_tag }}.apk"
           if [[ "$APK" == *-unsigned.apk ]]; then
-            APKSIGNER="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
-            ZIPALIGN="${ANDROID_HOME}/build-tools/35.0.0/zipalign"
+            BUILD_TOOLS=$(ls -d "${ANDROID_HOME}/build-tools/"* | sort -V | tail -1)
+            APKSIGNER="${BUILD_TOOLS}/apksigner"
+            ZIPALIGN="${BUILD_TOOLS}/zipalign"
             ALIGNED="dist/aligned.apk"
             "$ZIPALIGN" -f -p 4 "$APK" "$ALIGNED"
             keytool -genkeypair -v -keystore adhoc.jks -storepass android -alias androiddebugkey -keypass android \
@@ -143,11 +160,16 @@ jobs:
           fi
           cd dist && sha256sum *.apk > SHA256SUMS.txt
 
-      - name: Push merged branch & Release
+      - name: Push merged branch
+        if: steps.upstream.outputs.should_build == 'true' && steps.upstream.outputs.upstream_tag != ''
+        run: git push origin HEAD:master
+
+      - name: Create Release
         if: steps.upstream.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.upstream.outputs.release_tag }}
+          target_commitish: ${{ steps.merge.outputs.commit_sha || github.sha }}
           name: GameNative ${{ steps.upstream.outputs.release_tag }}
           body: |
             ## GameNative + LuaTools & CloudRedirect Mod (${{ steps.upstream.outputs.release_tag }})
