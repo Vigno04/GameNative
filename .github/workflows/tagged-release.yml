@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: github.repository == 'utkarshdalal/GameNative'
     timeout-minutes: 45
 
     steps:

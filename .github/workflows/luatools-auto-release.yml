@@ -118,12 +118,7 @@ jobs:
           KEYSTORE_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
           KEYSTORE_STORE_PASSWORD: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
         run: |
-          cat <<EOF > local.properties
-          POSTHOG_API_KEY=""
-          POSTHOG_HOST="https://us.i.posthog.com"
-          STEAMGRIDDB_API_KEY=""
-          CLOUD_PROJECT_NUMBER=""
-          EOF
+          touch local.properties
           mkdir -p app/keystores
           if [ -n "$KEYSTORE" ]; then
             echo "$KEYSTORE" | base64 --decode > app/keystores/keystore
