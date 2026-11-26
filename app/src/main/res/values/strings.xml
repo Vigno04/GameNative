@@ -241,6 +241,7 @@
     <string name="intent_launch_failed">Could not launch game: invalid launch shortcut</string>
     <string name="intent_launch_steam_pending">Game will launch when Steam connects</string>
     <string name="intent_launch_service_pending">Game will launch when service is ready</string>
+    <string name="intent_launch_sign_in_required">Sign in to %1$s to launch this game</string>
     <!--webview host: surfaced by ChromiumVersionGate on boot if chromium < min OR multi-profile unsupported -->
     <string name="webview_unsupported_chromium">HTML5 runtime unavailable — WebView %1$s is too old (Chromium %2$d or newer required)</string>
     <!--webview host: surfaced by WebViewScreen on compose-entry if gate failed at boot -->
@@ -2472,6 +2473,11 @@
     <plurals name="optimize_metric_minutes">
         <item quantity="one">%1$d min</item>
         <item quantity="other">%1$d min</item>
+    </plurals>
+    <string name="optimize_after_short">That session was too short to measure</string>
+    <plurals name="optimize_play_minutes">
+        <item quantity="one">Play for at least %1$d minute once the game is running, so we can tell whether the change helps.</item>
+        <item quantity="other">Play for at least %1$d minutes once the game is running, so we can tell whether the change helps.</item>
     </plurals>
     <string name="settings_group_cloud_saves">Cloud saves</string>
     <string name="settings_save_backups_to_keep">Save backups to keep</string>

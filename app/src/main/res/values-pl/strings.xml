@@ -261,6 +261,7 @@
     <string name="intent_launch_failed">Nie udało się uruchomić gry: nieprawidłowy skrót uruchamiania</string>
     <string name="intent_launch_steam_pending">Gra zostanie uruchomiona po połączeniu ze Steam</string>
     <string name="intent_launch_service_pending">Gra zostanie uruchomiona po uruchomieniu usługi</string>
+    <string name="intent_launch_sign_in_required">Zaloguj się do %1$s, aby uruchomić tę grę</string>
     <string name="intent_launch_steam_login_failed">Logowanie do Steam nie powiodło się — uruchomienie gry anulowane</string>
     <string name="intent_launch_service_timeout">Nie udało się uruchomić usługi gry — uruchomienie gry anulowane</string>
     <string name="back_press_exit_warning">Naciśnij wstecz ponownie, aby wyjść</string>
@@ -2209,6 +2210,13 @@
         <item quantity="few">%1$d min</item>
         <item quantity="many">%1$d min</item>
         <item quantity="other">%1$d min</item>
+    </plurals>
+    <string name="optimize_after_short">Ta sesja była zbyt krótka, żeby ją zmierzyć</string>
+    <plurals name="optimize_play_minutes">
+        <item quantity="one">Graj co najmniej %1$d minutę po uruchomieniu gry, abyśmy mogli sprawdzić, czy zmiana pomaga.</item>
+        <item quantity="few">Graj co najmniej %1$d minuty po uruchomieniu gry, abyśmy mogli sprawdzić, czy zmiana pomaga.</item>
+        <item quantity="many">Graj co najmniej %1$d minut po uruchomieniu gry, abyśmy mogli sprawdzić, czy zmiana pomaga.</item>
+        <item quantity="other">Graj co najmniej %1$d minuty po uruchomieniu gry, abyśmy mogli sprawdzić, czy zmiana pomaga.</item>
     </plurals>
     <string name="settings_group_cloud_saves">Zapisy w chmurze</string>
     <string name="settings_save_backups_to_keep">Liczba przechowywanych kopii zapisów</string>

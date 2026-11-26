@@ -264,6 +264,7 @@
     <string name="intent_launch_failed">No se pudo iniciar el juego: acceso directo de inicio no válido</string>
     <string name="intent_launch_steam_pending">El juego se iniciará cuando Steam se conecte</string>
     <string name="intent_launch_service_pending">El juego se iniciará cuando el servicio esté listo</string>
+    <string name="intent_launch_sign_in_required">Inicia sesión en %1$s para iniciar este juego</string>
     <string name="intent_launch_steam_login_failed">Error de inicio de sesión en Steam — lanzamiento del juego cancelado</string>
     <string name="intent_launch_service_timeout">El servicio del juego no pudo iniciarse — lanzamiento del juego cancelado</string>
     <string name="back_press_exit_warning">Pulsa atrás de nuevo para salir</string>
@@ -2179,6 +2180,11 @@
     <plurals name="optimize_metric_minutes">
         <item quantity="one">%1$d min</item>
         <item quantity="other">%1$d min</item>
+    </plurals>
+    <string name="optimize_after_short">Esa sesión fue demasiado corta para medirla</string>
+    <plurals name="optimize_play_minutes">
+        <item quantity="one">Juega al menos %1$d minuto con el juego en marcha para que podamos saber si el cambio ayuda.</item>
+        <item quantity="other">Juega al menos %1$d minutos con el juego en marcha para que podamos saber si el cambio ayuda.</item>
     </plurals>
     <string name="settings_group_cloud_saves">Partidas en la nube</string>
     <string name="settings_save_backups_to_keep">Copias de seguridad de partidas a conservar</string>

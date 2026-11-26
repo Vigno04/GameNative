@@ -256,6 +256,7 @@
     <string name="intent_launch_failed">Impossible de lancer le jeu : raccourci de lancement invalide</string>
     <string name="intent_launch_steam_pending">Le jeu se lancera une fois Steam connecté</string>
     <string name="intent_launch_service_pending">Le jeu se lancera une fois le service prêt</string>
+    <string name="intent_launch_sign_in_required">Connectez-vous à %1$s pour lancer ce jeu</string>
     <string name="intent_launch_steam_login_failed">Échec de la connexion Steam — lancement du jeu annulé</string>
     <string name="intent_launch_service_timeout">Échec du démarrage du service de jeu — lancement du jeu annulé</string>
     <string name="back_press_exit_warning">Appuyez à nouveau sur retour pour quitter</string>
@@ -2199,6 +2200,11 @@
     <plurals name="optimize_metric_minutes">
         <item quantity="one">%1$d min</item>
         <item quantity="other">%1$d min</item>
+    </plurals>
+    <string name="optimize_after_short">Cette session était trop courte pour être mesurée</string>
+    <plurals name="optimize_play_minutes">
+        <item quantity="one">Jouez au moins %1$d minute une fois le jeu lancé, pour que nous puissions voir si le changement aide.</item>
+        <item quantity="other">Jouez au moins %1$d minutes une fois le jeu lancé, pour que nous puissions voir si le changement aide.</item>
     </plurals>
     <string name="settings_group_cloud_saves">Sauvegardes cloud</string>
     <string name="settings_save_backups_to_keep">Copies des sauvegardes à conserver</string>
