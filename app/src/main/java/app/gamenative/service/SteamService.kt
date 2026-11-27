@@ -31,6 +31,10 @@ import app.gamenative.data.EncryptedAppTicket
 import app.gamenative.data.GameProcessInfo
 import app.gamenative.data.GameSource
 import app.gamenative.data.LaunchInfo
+import app.gamenative.data.LibraryAssetsInfo
+import app.gamenative.data.LibraryCapsuleInfo
+import app.gamenative.data.LibraryHeroInfo
+import app.gamenative.data.LibraryLogoInfo
 import app.gamenative.data.ManifestInfo
 import app.gamenative.data.forBranch
 import app.gamenative.data.OwnedGames
@@ -52,6 +56,7 @@ import app.gamenative.db.dao.SteamAppDao
 import app.gamenative.db.dao.SteamFileHashCacheDao
 import app.gamenative.db.dao.SteamLicenseDao
 import app.gamenative.enums.AppType
+import app.gamenative.enums.Language
 import app.gamenative.enums.LoginResult
 import app.gamenative.enums.Marker
 import app.gamenative.enums.OS
@@ -3462,10 +3467,16 @@ class SteamService : Service(), IChallengeUrlChanged {
                     val existingApp = svc.appDao.findApp(appId)
                     val hasAllLuaDepots = existingApp != null &&
                         luaDepotIds.all { id -> (existingApp.depots[id]?.manifests?.get("public")?.size ?: 0L) > 0L }
+                    val hasMetadata = existingApp != null &&
+                        (existingApp.developer.isNotBlank() || existingApp.releaseDate > 0L) &&
+                        (existingApp.libraryAssets.libraryCapsule.image.isNotEmpty() ||
+                            existingApp.headerImage.isNotEmpty() ||
+                            existingApp.iconHash.isNotBlank())
                     if (existingApp != null &&
                         existingApp.packageId != INVALID_PKG_ID &&
                         existingApp.receivedPICS &&
                         hasAllLuaDepots &&
+                        hasMetadata &&
                         (ownerList.isEmpty() || existingApp.ownerAccountId.any { it in ownerList })
                     ) {
                         return@launch
@@ -3474,7 +3485,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                     val targetPkgId = existingLicense?.packageId ?: pkgId
                     var resolvedApp: SteamApp? = null
                     val steamApps = svc._steamApps
-                    if (steamApps != null && isConnected && (existingApp == null || !existingApp.receivedPICS)) {
+                    if (steamApps != null && isConnected && (existingApp == null || !existingApp.receivedPICS || !hasMetadata)) {
                         try {
                             val token = try {
                                 steamApps.picsGetAccessTokens(
@@ -3504,10 +3515,16 @@ class SteamService : Service(), IChallengeUrlChanged {
                         }
                     }
 
-                    val baseApp = resolvedApp ?: existingApp ?: SteamApp(id = appId)
+                    val rawBaseApp = resolvedApp ?: existingApp ?: SteamApp(id = appId)
+                    val needsSteamCmdFallback = resolvedApp == null ||
+                        rawBaseApp.depots.isEmpty() ||
+                        (rawBaseApp.developer.isBlank() && rawBaseApp.releaseDate == 0L) ||
+                        (rawBaseApp.libraryAssets.libraryCapsule.image.isEmpty() && rawBaseApp.headerImage.isEmpty())
+                    val steamCmdPics = if (needsSteamCmdFallback) hook.store.getPicsInfo(appId) else null
+                    val baseApp = if (steamCmdPics != null) applySteamCmdMetadata(rawBaseApp, steamCmdPics) else rawBaseApp
                     val mergedDepots = baseApp.depots.toMutableMap()
-                    if (mergedDepots.isEmpty()) {
-                        mergedDepots.putAll(parseSteamCmdDepots(hook.store.getPicsInfo(appId)))
+                    if (mergedDepots.isEmpty() && steamCmdPics != null) {
+                        mergedDepots.putAll(parseSteamCmdDepots(steamCmdPics))
                     }
                     for ((depotId, manifestId) in luaDepotManifests) {
                         val cur = mergedDepots[depotId]
@@ -3559,6 +3576,140 @@ class SteamService : Service(), IChallengeUrlChanged {
                     Timber.w(e, "syncLuaToolsApp failed for $appId")
                 }
             }
+        }
+
+        private fun parseLanguageMap(obj: org.json.JSONObject?): Map<Language, String> {
+            if (obj == null) return emptyMap()
+            val out = mutableMapOf<Language, String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = obj.optString(k, "")
+                if (v.isNotBlank()) {
+                    val lang = Language.from(k)
+                    if (lang != Language.unknown || k.equals("unknown", ignoreCase = true)) {
+                        out[lang] = v
+                    }
+                }
+            }
+            return out
+        }
+
+        private fun applySteamCmdMetadata(base: SteamApp, picsJson: org.json.JSONObject?): SteamApp {
+            if (picsJson == null) return base
+            val common = picsJson.optJSONObject("common")
+            val extended = picsJson.optJSONObject("extended")
+
+            val name = base.name.ifBlank { common?.optString("name", "").orEmpty() }
+            val iconHash = base.iconHash.ifBlank { common?.optString("icon", "").orEmpty() }
+            val clientIconHash = base.clientIconHash.ifBlank { common?.optString("clienticon", "").orEmpty() }
+            val logoHash = base.logoHash.ifBlank { common?.optString("logo", "").orEmpty() }
+            val logoSmallHash = base.logoSmallHash.ifBlank { common?.optString("logo_small", "").orEmpty() }
+
+            val releaseDate = if (base.releaseDate > 0L) {
+                base.releaseDate
+            } else {
+                common?.optString("steam_release_date", "")?.toLongOrNull()
+                    ?: common?.optLong("steam_release_date", 0L)
+                    ?: 0L
+            }
+
+            val metacriticScore = if (base.metacriticScore != 0.toByte()) {
+                base.metacriticScore
+            } else {
+                common?.optString("metacritic_score", "")?.toIntOrNull()?.toByte() ?: 0
+            }
+            val metacriticFullUrl = base.metacriticFullUrl.ifBlank {
+                common?.optString("metacritic_fullurl", "").orEmpty()
+            }
+            val reviewScore = if (base.reviewScore != 0.toByte()) {
+                base.reviewScore
+            } else {
+                common?.optString("review_score", "")?.toIntOrNull()?.toByte() ?: 0
+            }
+            val reviewPercentage = if (base.reviewPercentage != 0.toByte()) {
+                base.reviewPercentage
+            } else {
+                common?.optString("review_percentage", "")?.toIntOrNull()?.toByte() ?: 0
+            }
+
+            val headerImage = base.headerImage.ifEmpty {
+                parseLanguageMap(common?.optJSONObject("header_image"))
+            }
+            val smallCapsule = base.smallCapsule.ifEmpty {
+                parseLanguageMap(common?.optJSONObject("small_capsule"))
+            }
+
+            val existingAssets = base.libraryAssets
+            val fullAssets = common?.optJSONObject("library_assets_full")
+            val libraryAssets = if (existingAssets.libraryCapsule.image.isNotEmpty() || fullAssets == null) {
+                if (existingAssets.libraryCapsule.image.isEmpty() && common?.optJSONObject("library_assets") != null) {
+                    LibraryAssetsInfo(
+                        libraryCapsule = LibraryCapsuleInfo(image = mapOf(Language.english to "library_600x900.jpg")),
+                        libraryHero = LibraryHeroInfo(image = mapOf(Language.english to "library_hero.jpg")),
+                        libraryLogo = LibraryLogoInfo(image = mapOf(Language.english to "logo.png")),
+                    )
+                } else {
+                    existingAssets
+                }
+            } else {
+                val cap = fullAssets.optJSONObject("library_capsule")
+                val hero = fullAssets.optJSONObject("library_hero")
+                val logo = fullAssets.optJSONObject("library_logo")
+                LibraryAssetsInfo(
+                    libraryCapsule = LibraryCapsuleInfo(
+                        image = parseLanguageMap(cap?.optJSONObject("image")),
+                        image2x = parseLanguageMap(cap?.optJSONObject("image2x")),
+                    ),
+                    libraryHero = LibraryHeroInfo(
+                        image = parseLanguageMap(hero?.optJSONObject("image")),
+                        image2x = parseLanguageMap(hero?.optJSONObject("image2x")),
+                    ),
+                    libraryLogo = LibraryLogoInfo(
+                        image = parseLanguageMap(logo?.optJSONObject("image")),
+                        image2x = parseLanguageMap(logo?.optJSONObject("image2x")),
+                    ),
+                )
+            }
+
+            var developer = base.developer.ifBlank { extended?.optString("developer", "").orEmpty() }
+            var publisher = base.publisher.ifBlank { extended?.optString("publisher", "").orEmpty() }
+            if (developer.isBlank() || publisher.isBlank()) {
+                val assoc = common?.optJSONObject("associations")
+                val aKeys = assoc?.keys()
+                if (aKeys != null) {
+                    val devs = mutableListOf<String>()
+                    val pubs = mutableListOf<String>()
+                    while (aKeys.hasNext()) {
+                        val entry = assoc.optJSONObject(aKeys.next()) ?: continue
+                        val type = entry.optString("type", "")
+                        val aName = entry.optString("name", "")
+                        if (aName.isBlank()) continue
+                        if (type.equals("developer", ignoreCase = true)) devs.add(aName)
+                        else if (type.equals("publisher", ignoreCase = true)) pubs.add(aName)
+                    }
+                    if (developer.isBlank() && devs.isNotEmpty()) developer = devs.joinToString(", ")
+                    if (publisher.isBlank() && pubs.isNotEmpty()) publisher = pubs.joinToString(", ")
+                }
+            }
+
+            return base.copy(
+                name = name,
+                releaseDate = releaseDate,
+                metacriticScore = metacriticScore,
+                metacriticFullUrl = metacriticFullUrl,
+                iconHash = iconHash,
+                clientIconHash = clientIconHash,
+                logoHash = logoHash,
+                logoSmallHash = logoSmallHash,
+                smallCapsule = smallCapsule,
+                headerImage = headerImage,
+                libraryAssets = libraryAssets,
+                reviewScore = reviewScore,
+                reviewPercentage = reviewPercentage,
+                developer = developer,
+                publisher = publisher,
+            )
         }
 
         private fun parseSteamCmdDepots(picsJson: org.json.JSONObject?): Map<Int, DepotInfo> {
@@ -3630,8 +3781,8 @@ class SteamService : Service(), IChallengeUrlChanged {
                 val prefixDir = File(ImageFs.find(luaCtx).rootDir, ImageFs.WINEPREFIX)
                 val steamId64Str = (userSteamId?.convertToUInt64() ?: PrefManager.steamUserSteamId64)
                     .takeIf { it != 0L }?.toString() ?: ""
-                val saveDir = LuaToolsCloudSync.resolveCloudSaveDir(luaCtx, appId, prefixDir, "xuser", steamId64Str)
-                LuaToolsCloudSync.onPreLaunch(luaCtx, appId, saveDir)
+                val target = LuaToolsCloudSync.resolveCloudSaveTarget(luaCtx, appId, prefixDir, "xuser", steamId64Str)
+                LuaToolsCloudSync.onPreLaunch(luaCtx, appId, target)
                 return@asyncIsolated PostSyncInfo(SyncResult.UpToDate)
             }
             if (isOffline || !isConnected) {
@@ -3791,8 +3942,8 @@ class SteamService : Service(), IChallengeUrlChanged {
                     val prefixDir = File(ImageFs.find(context).rootDir, ImageFs.WINEPREFIX)
                     val steamId64Str = (userSteamId?.convertToUInt64() ?: PrefManager.steamUserSteamId64)
                         .takeIf { it != 0L }?.toString() ?: ""
-                    val saveDir = LuaToolsCloudSync.resolveCloudSaveDir(context, appId, prefixDir, "xuser", steamId64Str)
-                    LuaToolsCloudSync.onPostExit(context, appId, saveDir)
+                    val target = LuaToolsCloudSync.resolveCloudSaveTarget(context, appId, prefixDir, "xuser", steamId64Str)
+                    LuaToolsCloudSync.onPostExit(context, appId, target)
                     return@async
                 }
                 if (isOffline || !isConnected) {
